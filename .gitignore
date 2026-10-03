@@ -118,6 +118,14 @@ ipython_config.py
 .pdm-python
 .pdm-build/
 
+# Local environments and editor metadata
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
 # pixi
 #   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
 # pixi.lock
