@@ -16,6 +16,25 @@ class TrainingData:
     labels: np.ndarray
 
 
+@dataclass(frozen=True)
+class EvictionDecision:
+    """The model scores and selected index for one full-frame page fault."""
+
+    victim_index: int
+    victim: int
+    feature_rows: tuple[tuple[float, ...], ...]
+    scores: tuple[float, ...]
+
+    @property
+    def confidence(self) -> float:
+        """Probability of class 1 for the candidate actually selected."""
+        return self.scores[self.victim_index]
+
+    @property
+    def chosen_features(self) -> tuple[float, ...]:
+        return self.feature_rows[self.victim_index]
+
+
 def build_training_data(
     traces: Iterable[Sequence[int]], frame_count: int, window_size: int = 20
 ) -> TrainingData:
@@ -83,6 +102,49 @@ class LearnedPager:
         self.is_fitted = True
         return training_data
 
+    def choose_victim(
+        self,
+        frames: Sequence[int],
+        current_index: int,
+        last_seen: dict[int, int],
+        observed_prefix: Sequence[int],
+    ) -> EvictionDecision:
+        """Score resident pages and reproduce the learned victim selection."""
+        if not self.is_fitted:
+            raise RuntimeError("fit must be called before choosing a victim")
+        if len(frames) != self.frame_count:
+            raise ValueError("victim selection requires a full frame set")
+
+        feature_rows = [
+            candidate_features(
+                candidate,
+                current_index,
+                last_seen,
+                observed_prefix,
+                self.window_size,
+            )
+            for candidate in frames
+        ]
+        positive_column = list(self.classifier.classes_).index(1)
+        probabilities = self.classifier.predict_proba(feature_rows)[
+            :, positive_column
+        ]
+
+        # Ties prefer greater recency, then the earlier frame. This is the same
+        # deterministic rule used by the original learned-policy simulation.
+        victim_index = max(
+            range(len(frames)),
+            key=lambda position: (
+                probabilities[position], feature_rows[position][0], -position
+            ),
+        )
+        return EvictionDecision(
+            victim_index=victim_index,
+            victim=frames[victim_index],
+            feature_rows=tuple(tuple(row) for row in feature_rows),
+            scores=tuple(float(score) for score in probabilities),
+        )
+
     def simulate(self, trace: Sequence[int]) -> SimulationResult:
         """Run inference using only the prefix observed before each decision."""
         if not self.is_fitted:
@@ -99,28 +161,13 @@ class LearnedPager:
             if not hit:
                 if len(frames) == self.frame_count:
                     observed_prefix = trace_list[:index]
-                    feature_rows = [
-                        candidate_features(
-                            candidate,
-                            index,
-                            last_seen,
-                            observed_prefix,
-                            self.window_size,
-                        )
-                        for candidate in frames
-                    ]
-                    positive_column = list(self.classifier.classes_).index(1)
-                    scores = self.classifier.predict_proba(feature_rows)[
-                        :, positive_column
-                    ]
-                    # Ties prefer greater recency, then the earlier frame.
-                    victim_index = max(
-                        range(len(frames)),
-                        key=lambda position: (
-                            scores[position], feature_rows[position][0], -position
-                        ),
+                    decision = self.choose_victim(
+                        frames,
+                        index,
+                        last_seen,
+                        observed_prefix,
                     )
-                    evicted = frames.pop(victim_index)
+                    evicted = frames.pop(decision.victim_index)
                 frames.append(page)
             last_seen[page] = index
             events.append(AccessEvent(index, page, hit, evicted, tuple(frames)))
